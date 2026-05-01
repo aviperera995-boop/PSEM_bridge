@@ -3,7 +3,7 @@ const admin = require('firebase-admin');
 const express = require('express');
 
 // ============================================================
-// CONFIGURATION - Already configured for your project!
+// CONFIGURATION
 // ============================================================
 
 // HiveMQ Cloud
@@ -12,8 +12,9 @@ const MQTT_PORT = 8883;
 const MQTT_USERNAME = 'PSEM2026';
 const MQTT_PASSWORD = 'Pdah@1002#';
 
-// Firebase Database URL (your Singapore region URL)
-const FIREBASE_DB_URL = 'https://psem2026-52929-default-rtdb.asia-southeast1.firebasedatabase.app';
+// Firebase Database URL
+const FIREBASE_DB_URL =
+  'https://psem2026-52929-default-rtdb.asia-southeast1.firebasedatabase.app';
 
 const PORT = process.env.PORT || 3000;
 
@@ -22,6 +23,7 @@ const PORT = process.env.PORT || 3000;
 // ============================================================
 
 let serviceAccount;
+
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   console.log('Firebase: env credentials');
@@ -48,7 +50,7 @@ const mqttOptions = {
   protocol: 'mqtts',
   username: MQTT_USERNAME,
   password: MQTT_PASSWORD,
-  clientId: 'bridge_' + Math.random().toString(16).substr(2, 8),
+  clientId: 'bridge_' + Math.random().toString(16).substring(2, 10),
   rejectUnauthorized: false,
   keepalive: 60,
   reconnectPeriod: 5000
@@ -60,11 +62,17 @@ const mqttClient = mqtt.connect(mqttOptions);
 const lastHistorySave = {};
 const HISTORY_INTERVAL = 30000;
 
+// ============================================================
+// MQTT EVENTS
+// ============================================================
+
 mqttClient.on('connect', () => {
   console.log('MQTT Connected!');
+
   mqttClient.subscribe('smartmeter/+/data', { qos: 1 });
   mqttClient.subscribe('smartmeter/+/status', { qos: 1 });
   mqttClient.subscribe('smartmeter/+/alert', { qos: 1 });
+
   console.log('Subscribed to all topics');
 });
 
@@ -89,20 +97,17 @@ mqttClient.on('message', async (topic, message) => {
     const parts = topic.split('/');
     const meterId = parts[1];
     const messageType = parts[2];
+
     const data = JSON.parse(message.toString());
-    
-    if (messageType === 'data') {
-      console.log('[' + meterId + '] V:' + data.voltage + ' P:' + data.power + 'W Bal:Rs.' + data.balance);
-    } else {
-      console.log('[' + meterId + '] ' + messageType);
-    }
-    
+
     if (messageType === 'data') {
       await handleData(meterId, data);
     } else if (messageType === 'status') {
       await handleStatus(meterId, data);
     } else if (messageType === 'alert') {
       await handleAlert(meterId, data);
+    } else {
+      console.log('Unknown message type:', messageType);
     }
   } catch (err) {
     console.error('Error:', err.message);
@@ -114,84 +119,158 @@ mqttClient.on('message', async (topic, message) => {
 // ============================================================
 
 async function handleData(meterId, data) {
-  const timestamp = admin.database.ServerValue.TIMESTAMP;
-  
+  const timestamp = Date.now();
+
+  // Use ESP32 TOU total as today's energy
+  const todayEnergy = Number(data.energy ?? data.daily_kwh ?? 0);
+
+  const peakKwh = Number(data.tou_peak ?? 0);
+  const dayKwh = Number(data.tou_day ?? 0);
+  const offpeakKwh = Number(data.tou_offpeak ?? 0);
+
+  const peakCost = Number(data.cost_peak ?? 0);
+  const dayCost = Number(data.cost_day ?? 0);
+  const offpeakCost = Number(data.cost_offpeak ?? 0);
+
   await db.ref('meters/' + meterId + '/realtime').update({
-    voltage: data.voltage || 0,
-    current: data.current || 0,
-    power: data.power || 0,
-    energy: data.energy || 0,
-    frequency: data.frequency || 50,
-    pf: data.pf || 0,
-    balance: data.balance || 0,
+    meter_id: data.meter_id || meterId,
+
+    voltage: Number(data.voltage ?? 0),
+    current: Number(data.current ?? 0),
+    power: Number(data.power ?? 0),
+
+    // Today energy = Peak + Day + Off-Peak from ESP32
+    energy: todayEnergy,
+    daily_kwh: todayEnergy,
+
+    // PZEM lifetime total
+    total_energy: Number(data.total_energy ?? 0),
+
+    frequency: Number(data.frequency ?? 50),
+    pf: Number(data.pf ?? 0),
+    balance: Number(data.balance ?? 0),
+
     period: data.period || 'DAY',
-    rate: data.rate || 0,
+    rate: Number(data.rate ?? 0),
+
+    tou_peak: peakKwh,
+    tou_day: dayKwh,
+    tou_offpeak: offpeakKwh,
+
+    cost_peak: peakCost,
+    cost_day: dayCost,
+    cost_offpeak: offpeakCost,
+
     relay: data.relay || 'OFF',
     mode: data.mode || 'AUTO',
-    daily_kwh: data.daily_kwh || 0,
-    monthly_kwh: data.monthly_kwh || 0,
-    wifi_rssi: data.wifi_rssi || 0,
+
+    monthly_kwh: Number(data.monthly_kwh ?? 0),
+    wifi_rssi: Number(data.wifi_rssi ?? 0),
+    uptime: Number(data.uptime ?? 0),
+    led_status: data.led_status || '--',
+
     last_update: timestamp,
     status: 'online'
   });
-  
+
+  await updateDailySummary(meterId, data);
+
+  console.log(
+    `[${meterId}] ` +
+      `Today:${todayEnergy} ` +
+      `TOU(P/D/O):${peakKwh}/${dayKwh}/${offpeakKwh} ` +
+      `Cost(P/D/O):${peakCost}/${dayCost}/${offpeakCost} ` +
+      `Bal:Rs.${data.balance}`
+  );
+
   const now = Date.now();
+
   if (now - (lastHistorySave[meterId] || 0) > HISTORY_INTERVAL) {
     await db.ref('meters/' + meterId + '/history').push({
-      voltage: data.voltage,
-      current: data.current,
-      power: data.power,
-      energy: data.energy,
-      balance: data.balance,
+      voltage: Number(data.voltage ?? 0),
+      current: Number(data.current ?? 0),
+      power: Number(data.power ?? 0),
+
+      energy: todayEnergy,
+      daily_kwh: todayEnergy,
+      total_energy: Number(data.total_energy ?? 0),
+
+      tou_peak: peakKwh,
+      tou_day: dayKwh,
+      tou_offpeak: offpeakKwh,
+
+      balance: Number(data.balance ?? 0),
       timestamp: timestamp
     });
+
     lastHistorySave[meterId] = now;
-    await updateDailySummary(meterId, data);
   }
 }
 
 async function updateDailySummary(meterId, data) {
   const today = new Date().toISOString().split('T')[0];
-  const ref = db.ref('meters/' + meterId + '/daily_summary/' + today);
-  const snap = await ref.once('value');
-  let s = snap.val() || {
-    start_energy: data.energy,
-    end_energy: data.energy,
-    peak_power: 0,
-    avg_power: 0,
-    total_kwh: 0,
-    total_cost: 0,
-    sample_count: 0,
-    power_sum: 0
-  };
-  
-  s.end_energy = data.energy;
-  s.peak_power = Math.max(s.peak_power || 0, data.power || 0);
-  s.power_sum = (s.power_sum || 0) + (data.power || 0);
-  s.sample_count = (s.sample_count || 0) + 1;
-  s.avg_power = s.power_sum / s.sample_count;
-  s.total_kwh = s.end_energy - s.start_energy;
-  s.total_cost = s.total_kwh * (data.rate || 50);
-  
-  await ref.set(s);
+
+  const peakKwh = Number(data.tou_peak ?? 0);
+  const dayKwh = Number(data.tou_day ?? 0);
+  const offpeakKwh = Number(data.tou_offpeak ?? 0);
+
+  const peakCost = Number(data.cost_peak ?? 0);
+  const dayCost = Number(data.cost_day ?? 0);
+  const offpeakCost = Number(data.cost_offpeak ?? 0);
+
+  const totalKwh = peakKwh + dayKwh + offpeakKwh;
+  const totalCost = peakCost + dayCost + offpeakCost;
+
+  await db.ref('meters/' + meterId + '/daily_bills/' + today).set({
+    date: today,
+
+    peak_kwh: Number(peakKwh.toFixed(3)),
+    day_kwh: Number(dayKwh.toFixed(3)),
+    offpeak_kwh: Number(offpeakKwh.toFixed(3)),
+
+    peak_cost: Number(peakCost.toFixed(2)),
+    day_cost: Number(dayCost.toFixed(2)),
+    offpeak_cost: Number(offpeakCost.toFixed(2)),
+
+    total_kwh: Number(totalKwh.toFixed(3)),
+    total_cost: Number(totalCost.toFixed(2)),
+
+    balance: Number(data.balance ?? 0),
+    period: data.period || '--',
+    rate: Number(data.rate ?? 0),
+
+    total_energy: Number(data.total_energy ?? 0),
+    monthly_kwh: Number(data.monthly_kwh ?? 0),
+
+    updated_at: admin.database.ServerValue.TIMESTAMP
+  });
 }
 
 async function handleStatus(meterId, data) {
   await db.ref('meters/' + meterId + '/connection').update({
-    status: data.status,
+    status: data.status || 'unknown',
     last_seen: admin.database.ServerValue.TIMESTAMP,
-    ip_address: data.ip || null
+    ip_address: data.ip || null,
+    balance: Number(data.balance ?? 0)
   });
+
+  await db.ref('meters/' + meterId + '/realtime').update({
+    status: data.status || 'unknown',
+    last_update: Date.now()
+  });
+
+  console.log('[' + meterId + '] status:', data.status);
 }
 
 async function handleAlert(meterId, data) {
   await db.ref('meters/' + meterId + '/alerts').push({
-    type: data.type,
-    message: data.message,
-    balance: data.balance,
+    type: data.type || 'unknown',
+    message: data.message || '',
+    balance: Number(data.balance ?? 0),
     timestamp: admin.database.ServerValue.TIMESTAMP,
     acknowledged: false
   });
+
   console.log('Alert [' + meterId + ']: ' + data.type);
 }
 
@@ -199,22 +278,62 @@ async function handleAlert(meterId, data) {
 // CLOUD COMMANDS (Web Dashboard -> MQTT)
 // ============================================================
 
-db.ref('mqtt_commands').on('child_added', (snapshot) => {
-  const cmd = snapshot.val();
-  if (cmd && cmd.meter_id && cmd.type) {
+db.ref('mqtt_commands').on('child_added', async (snapshot) => {
+  try {
+    const cmd = snapshot.val();
+
+    if (!cmd || !cmd.meter_id || !cmd.type) {
+      await snapshot.ref.remove();
+      return;
+    }
+
+    const commandId =
+      cmd.command_id ||
+      (cmd.payload && cmd.payload.command_id) ||
+      snapshot.key;
+
+    const processedRef = db.ref('processed_commands/' + commandId);
+    const processedSnap = await processedRef.once('value');
+
+    if (processedSnap.exists()) {
+      console.log('Duplicate command ignored:', commandId);
+      await snapshot.ref.remove();
+      return;
+    }
+
+    await processedRef.set({
+      meter_id: cmd.meter_id,
+      type: cmd.type,
+      created_at: admin.database.ServerValue.TIMESTAMP
+    });
+
     const topic = 'smartmeter/' + cmd.meter_id + '/' + cmd.type;
-    const payload = JSON.stringify(cmd.payload || {});
-    mqttClient.publish(topic, payload, { qos: 1 }, (err) => {
-      if (!err) {
-        console.log('Sent: ' + topic);
-        snapshot.ref.remove();
+
+    const payload = JSON.stringify(
+      cmd.payload || {
+        amount: cmd.amount,
+        source: 'web_dashboard',
+        command_id: commandId
+      }
+    );
+
+    // Remove first to prevent repeat after bridge restart/reconnect
+    await snapshot.ref.remove();
+
+    mqttClient.publish(topic, payload, { qos: 0, retain: false }, (err) => {
+      if (err) {
+        console.error('Command publish failed:', err.message);
+      } else {
+        console.log('Sent:', topic, payload);
       }
     });
+  } catch (err) {
+    console.error('Command error:', err.message);
   }
 });
 
 // ============================================================
-// EXPRESS SERVER (Health Check)
+// EXPRESS SERVER
 // ============================================================
 
 const app = express();
@@ -235,6 +354,7 @@ app.get('/health', (req, res) => {
     status: mqttClient.connected ? 'healthy' : 'degraded'
   });
 });
+
 app.get('/stats', async (req, res) => {
   try {
     const metersSnap = await db.ref('meters').once('value');
@@ -242,10 +362,12 @@ app.get('/stats', async (req, res) => {
 
     const meterIds = Object.keys(meters);
 
-    const onlineMeters = meterIds.filter(id =>
-      meters[id]?.connection?.status === 'online' ||
-      meters[id]?.realtime?.status === 'online'
-    );
+    const onlineMeters = meterIds.filter((id) => {
+      return (
+        meters[id]?.connection?.status === 'online' ||
+        meters[id]?.realtime?.status === 'online'
+      );
+    });
 
     res.json({
       total_meters: meterIds.length,
@@ -255,7 +377,9 @@ app.get('/stats', async (req, res) => {
       uptime_seconds: Math.floor(process.uptime())
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: err.message
+    });
   }
 });
 
