@@ -194,3 +194,76 @@ app.listen(PORT, () => {
 console.log("=========================================");
 console.log(" Smart Meter Bridge Running ");
 console.log("=========================================");
+// ============================================================
+// CLOUD COMMANDS: WEB DASHBOARD -> FIREBASE -> MQTT
+// ============================================================
+
+db.ref("mqtt_commands").on("child_added", async (snapshot) => {
+  try {
+    const cmd = snapshot.val();
+
+    if (!cmd || !cmd.meter_id || !cmd.type) {
+      await snapshot.ref.remove();
+      return;
+    }
+
+    const commandId =
+      cmd.command_id ||
+      (cmd.payload && cmd.payload.command_id) ||
+      snapshot.key;
+
+    const processedRef = db.ref("processed_commands/" + commandId);
+    const processedSnap = await processedRef.once("value");
+
+    if (processedSnap.exists()) {
+      console.log("Duplicate command ignored:", commandId);
+      await snapshot.ref.remove();
+      return;
+    }
+
+    await processedRef.set({
+      meter_id: cmd.meter_id,
+      type: cmd.type,
+      created_at: admin.database.ServerValue.TIMESTAMP,
+    });
+
+    // Use topic from dashboard if available
+    // Otherwise build topic from meter_id and type
+    const topic = cmd.topic || `smartmeter/${cmd.meter_id}/${cmd.type}`;
+
+    const payload = JSON.stringify(
+      cmd.payload || {
+        amount: cmd.amount,
+        source: "web_dashboard",
+        command_id: commandId,
+      }
+    );
+
+    mqttClient.publish(topic, payload, { qos: 0, retain: false }, async (err) => {
+      if (err) {
+        console.error("Command publish failed:", err.message);
+
+        await snapshot.ref.update({
+          status: "failed",
+          error: err.message,
+          failed_at: admin.database.ServerValue.TIMESTAMP,
+        });
+
+        return;
+      }
+
+      console.log("Sent:", topic, payload);
+
+      // remove command after successful publish
+      await snapshot.ref.remove();
+    });
+  } catch (err) {
+    console.error("Command error:", err.message);
+
+    await snapshot.ref.update({
+      status: "failed",
+      error: err.message,
+      failed_at: admin.database.ServerValue.TIMESTAMP,
+    });
+  }
+});
