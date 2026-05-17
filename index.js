@@ -11,7 +11,7 @@ const MQTT_PORT = 8883;
 
 const MQTT_USERNAME = process.env.MQTT_USERNAME || "PSEM2026";
 const MQTT_PASSWORD =
-  process.env.MQTT_PASSWORD || "PASTE_YOUR_MQTT_PASSWORD_HERE";
+  process.env.MQTT_PASSWORD || "Pdah@1002#";
 
 const FIREBASE_DB_URL =
   "https://psem2026-52929-default-rtdb.asia-southeast1.firebasedatabase.app";
